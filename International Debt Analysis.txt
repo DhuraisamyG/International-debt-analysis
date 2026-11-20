@@ -1,0 +1,680 @@
+import os
+import sqlite3
+import pandas as pd
+import numpy as np
+
+# ==============================================================================
+# 1. FILE PATHS & ENCODING CONFIGURATION
+# ==============================================================================
+DATA_FILE = "IDS_ALLCountries_Data.csv"
+COUNTRY_META_FILE = "IDS_CountryMetaData.csv"
+SERIES_META_FILE = "Country-Series - Metadata.csv"
+FOOTNOTE_META_FILE = "IDS_FootNoteMetaData.csv"
+DB_NAME = "international_debt_clean.db"
+
+def classify_unit(indicator_name: str) -> str:
+    """Tags indicator measurement unit so USD sums don't mix with % or years."""
+    name_lower = indicator_name.lower()
+    if "us$" in name_lower or "usd" in name_lower:
+        return "USD"
+    elif "(%)" in name_lower or "percent" in name_lower:
+        return "Percentage"
+    elif "(years)" in name_lower:
+        return "Years"
+    return "Other"
+
+def clean_international_debt_pipeline():
+    print("Step 1: Loading raw World Bank CSV files (latin1 encoding)...")
+    raw_data = pd.read_csv(DATA_FILE, encoding="latin1")
+    raw_country_meta = pd.read_csv(COUNTRY_META_FILE, encoding="latin1")
+    raw_series_meta = pd.read_csv(SERIES_META_FILE, encoding="latin1")
+    raw_footnote_meta = pd.read_csv(FOOTNOTE_META_FILE, encoding="latin1")
+
+    # ==========================================================================
+    # 2. CLEAN COUNTRY DIMENSION TABLE (Exclude 14 Regional/Income Aggregates)
+    # ==========================================================================
+    dim_countries = raw_country_meta.dropna(subset=["Region"]).copy()
+    dim_countries = dim_countries[[
+        "Code", "Short Name", "Long Name", "Region",
+        "Income Group", "Lending category", "Currency Unit"
+    ]].copy()
+    dim_countries.columns = [
+        "country_code", "country_name", "long_name", "region",
+        "income_group", "lending_category", "currency_unit"
+    ]
+
+    for col in dim_countries.columns:
+        dim_countries[col] = dim_countries[col].fillna("Not Specified").astype(str).str.strip()
+
+    dim_countries = dim_countries.drop_duplicates(subset=["country_code"]).reset_index(drop=True)
+    valid_country_codes = set(dim_countries["country_code"])
+    print(f"Step 2: Cleaned dim_countries -> {len(dim_countries)} sovereign countries (14 aggregates removed).")
+
+    # ==========================================================================
+    # 3. CLEAN & UNPIVOT MAIN DEBT FACT TABLE (2000 - 2032)
+    # ==========================================================================
+    # Remove trailing footer rows where Country Code or Series Code is null
+    df = raw_data.dropna(subset=["Country Code", "Series Code"]).copy()
+    df["Country Code"] = df["Country Code"].astype(str).str.strip()
+    df["Series Code"] = df["Series Code"].astype(str).str.strip()
+    df["Country Name"] = df["Country Name"].astype(str).str.strip()
+    df["Series Name"] = df["Series Name"].astype(str).str.strip()
+
+    # Keep only valid sovereign countries
+    df = df[df["Country Code"].isin(valid_country_codes)].copy()
+
+    # Identify all year columns ('2000' through '2032')
+    year_cols = [c for c in df.columns if str(c).strip().isdigit()]
+
+    # Melt wide year columns into tidy relational format
+    fact_debt = df.melt(
+        id_vars=["Country Code", "Country Name", "Series Code", "Series Name"],
+        value_vars=year_cols,
+        var_name="year",
+        value_name="debt_value"
+    )
+
+    fact_debt.columns = ["country_code", "country_name", "indicator_code", "indicator_name", "year", "debt_value"]
+    fact_debt["year"] = fact_debt["year"].astype(int)
+    fact_debt["debt_value"] = pd.to_numeric(fact_debt["debt_value"], errors="coerce")
+
+    # Drop missing values and enforce uniqueness on (country_code, indicator_code, year)
+    raw_melted_count = len(fact_debt)
+    fact_debt = fact_debt.dropna(subset=["debt_value"]).copy()
+    fact_debt = fact_debt.drop_duplicates(subset=["country_code", "indicator_code", "year"]).reset_index(drop=True)
+
+    print(f"Step 3: Melted {raw_melted_count:,} cells -> {len(fact_debt):,} clean non-null records.")
+
+    # ==========================================================================
+    # 4. CLEAN INDICATORS DIMENSION TABLE
+    # ==========================================================================
+    dim_indicators = fact_debt[["indicator_code", "indicator_name"]].drop_duplicates(subset=["indicator_code"]).copy()
+    dim_indicators["unit_type"] = dim_indicators["indicator_name"].apply(classify_unit)
+    dim_indicators = dim_indicators.sort_values("indicator_code").reset_index(drop=True)
+    print(f"Step 4: Cleaned dim_indicators -> {len(dim_indicators)} unique indicators.")
+
+    # ==========================================================================
+    # 5. CLEAN SERIES NOTES & FOOTNOTE METADATA TABLES
+    # ==========================================================================
+    dim_series_notes = raw_series_meta.dropna(subset=["Country Code", "Series Code"]).drop_duplicates().copy()
+    dim_series_notes["country_code"] = dim_series_notes["Country Code"].str.extract(r"\(([A-Z]{3})\)$")
+    dim_series_notes["indicator_code"] = dim_series_notes["Series Code"].str.extract(r"\(([^()]+)\)$")
+    dim_series_notes = dim_series_notes[["country_code", "indicator_code", "Description"]].rename(
+        columns={"Description": "series_note"}
+    )
+    dim_series_notes = dim_series_notes[dim_series_notes["country_code"].isin(valid_country_codes)].reset_index(drop=True)
+
+    dim_footnotes = raw_footnote_meta.dropna(subset=["Country Code", "Series Code"]).drop_duplicates().copy()
+    dim_footnotes["country_code"] = dim_footnotes["Country Code"].str.extract(r"\(([A-Z]{3})\)$")
+    dim_footnotes["indicator_code"] = dim_footnotes["Series Code"].str.extract(r"\(([^()]+)\)$")
+    dim_footnotes["year"] = pd.to_numeric(dim_footnotes["Time Code"].str.extract(r"(\d{4})")[0], errors="coerce").astype("Int64")
+    dim_footnotes = dim_footnotes[["country_code", "indicator_code", "year", "Description"]].rename(
+        columns={"Description": "footnote_text"}
+    )
+    dim_footnotes = dim_footnotes[dim_footnotes["country_code"].isin(valid_country_codes)].reset_index(drop=True)
+    print(f"Step 5: Cleaned metadata -> {len(dim_series_notes)} series notes, {len(dim_footnotes)} footnotes.")
+
+    # ==========================================================================
+    # 6. EXPORT CLEANED CSVs (For Power BI, Excel & GitHub)
+    # ==========================================================================
+    dim_countries.to_csv("clean_dim_countries.csv", index=False)
+    dim_indicators.to_csv("clean_dim_indicators.csv", index=False)
+    fact_debt[["country_code", "indicator_code", "year", "debt_value"]].to_csv("clean_fact_debt_data.csv", index=False)
+    dim_series_notes.to_csv("clean_series_notes.csv", index=False)
+    dim_footnotes.to_csv("clean_footnotes.csv", index=False)
+
+    # Export a ready-to-use USD-only merged dataset for quick EDA & SQL queries
+    usd_codes = set(dim_indicators[dim_indicators["unit_type"] == "USD"]["indicator_code"])
+    clean_usd_debt = fact_debt[fact_debt["indicator_code"].isin(usd_codes)].merge(
+        dim_countries[["country_code", "region", "income_group"]], on="country_code", how="left"
+    )
+    clean_usd_debt.to_csv("cleaned_international_debt_usd.csv", index=False)
+
+    # ==========================================================================
+    # 7. LOAD INTO NORMALIZED RELATIONAL SQL DATABASE (Primary & Foreign Keys)
+    # ==========================================================================
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON;")
+
+    cursor.executescript("""
+        DROP TABLE IF EXISTS debt_data;
+        DROP TABLE IF EXISTS indicators;
+        DROP TABLE IF EXISTS countries;
+
+        CREATE TABLE countries (
+            country_code TEXT PRIMARY KEY,
+            country_name TEXT NOT NULL,
+            long_name TEXT,
+            region TEXT,
+            income_group TEXT,
+            lending_category TEXT,
+            currency_unit TEXT
+        );
+
+        CREATE TABLE indicators (
+            indicator_code TEXT PRIMARY KEY,
+            indicator_name TEXT NOT NULL,
+            unit_type TEXT NOT NULL
+        );
+
+        CREATE TABLE debt_data (
+            debt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_code TEXT NOT NULL,
+            indicator_code TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            debt REAL NOT NULL,
+            FOREIGN KEY (country_code) REFERENCES countries(country_code),
+            FOREIGN KEY (indicator_code) REFERENCES indicators(indicator_code)
+        );
+    """)
+
+    dim_countries.to_sql("countries", conn, if_exists="append", index=False)
+    dim_indicators.to_sql("indicators", conn, if_exists="append", index=False)
+    fact_debt[["country_code", "indicator_code", "year", "debt_value"]].rename(
+        columns={"debt_value": "debt"}
+    ).to_sql("debt_data", conn, if_exists="append", index=False)
+
+    cursor.execute("CREATE INDEX idx_debt_country ON debt_data(country_code);")
+    cursor.execute("CREATE INDEX idx_debt_indicator ON debt_data(indicator_code);")
+    cursor.execute("CREATE INDEX idx_debt_year ON debt_data(year);")
+
+    conn.commit()
+    conn.close()
+
+    print("\n? CLEANING COMPLETE! Generated files:")
+    print("   1. cleaned_international_debt_usd.csv (Monetary USD records for EDA/Dashboards)")
+    print("   2. clean_dim_countries.csv & clean_dim_indicators.csv (Power BI Dimensions)")
+    print("   3. clean_fact_debt_data.csv (Power BI Fact Table)")
+    print("   4. international_debt_clean.db (Normalized SQLite/SQL Database with PKs & FKs)")
+
+if __name__ == "__main__":
+    clean_international_debt_pipeline()
+
+
+display(pd.read_csv("clean_dim_countries.csv").head(20))
+display(pd.read_csv("clean_dim_indicators.csv").head(20))
+display(pd.read_csv("clean_fact_debt_usd.csv").head(20))
+
+# ==============================================================================
+# 1. INSTALL REQUIRED LIBRARIES
+# ==============================================================================
+import os
+import sys
+import subprocess
+
+def install_packages():
+    packages = ["pandas", "numpy", "plotly", "seaborn", "matplotlib", "streamlit"]
+    for pkg in packages:
+        try:
+            __import__(pkg)
+        except ImportError:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+install_packages()
+
+# ==============================================================================
+# 2. WRITE STREAMLIT + SQL + EDA APPLICATION (app.py)
+# ==============================================================================
+app_code = '''
+import os
+import io
+import zipfile
+import sqlite3
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import seaborn as sns
+import matplotlib.pyplot as plt
+import streamlit as st
+
+DATA_FILE = "IDS_ALLCountries_Data.csv"
+COUNTRY_META_FILE = "IDS_CountryMetaData.csv"
+DB_NAME = "international_debt_clean.db"
+
+def classify_unit(indicator_name: str) -> str:
+    name_lower = str(indicator_name).lower()
+    if "us$" in name_lower or "usd" in name_lower:
+        return "USD"
+    elif "(%)" in name_lower or "percent" in name_lower:
+        return "Percentage"
+    elif "(years)" in name_lower:
+        return "Years"
+    return "Other"
+
+@st.cache_data
+def prepare_real_data_and_db():
+    raw_data = pd.read_csv(DATA_FILE, encoding="latin1")
+    raw_country_meta = pd.read_csv(COUNTRY_META_FILE, encoding="latin1")
+
+    # 1. Clean Countries (Exclude 14 regional/income aggregates)
+    dim_countries = raw_country_meta.dropna(subset=["Region"]).copy()
+    dim_countries = dim_countries[[
+        "Code", "Short Name", "Long Name", "Region",
+        "Income Group", "Lending category", "Currency Unit"
+    ]].copy()
+    dim_countries.columns = [
+        "country_code", "country_name", "long_name", "region",
+        "income_group", "lending_category", "currency_unit"
+    ]
+    for col in dim_countries.columns:
+        dim_countries[col] = dim_countries[col].fillna("Not Specified").astype(str).str.strip()
+    dim_countries = dim_countries.drop_duplicates(subset=["country_code"]).reset_index(drop=True)
+    valid_codes = set(dim_countries["country_code"])
+
+    # 2. Clean Main Data & Melt Years (2000 - 2032)
+    df = raw_data.dropna(subset=["Country Code", "Series Code"]).copy()
+    df["Country Code"] = df["Country Code"].astype(str).str.strip()
+    df["Series Code"] = df["Series Code"].astype(str).str.strip()
+    df["Country Name"] = df["Country Name"].astype(str).str.strip()
+    df["Series Name"] = df["Series Name"].astype(str).str.strip()
+    df = df[df["Country Code"].isin(valid_codes)].copy()
+
+    year_cols = [c for c in df.columns if str(c).strip().isdigit()]
+    fact_debt = df.melt(
+        id_vars=["Country Code", "Country Name", "Series Code", "Series Name"],
+        value_vars=year_cols,
+        var_name="year",
+        value_name="debt"
+    )
+    fact_debt.columns = ["country_code", "country_name", "indicator_code", "indicator_name", "year", "debt"]
+    fact_debt["year"] = fact_debt["year"].astype(int)
+    fact_debt["debt"] = pd.to_numeric(fact_debt["debt"], errors="coerce")
+    fact_debt = fact_debt.dropna(subset=["debt"]).drop_duplicates(subset=["country_code", "indicator_code", "year"]).copy()
+
+    # 3. Clean Indicators & Keep Monetary (USD) Series for Accurate Financial Totals
+    dim_indicators = fact_debt[["indicator_code", "indicator_name"]].drop_duplicates(subset=["indicator_code"]).copy()
+    dim_indicators["unit_type"] = dim_indicators["indicator_name"].apply(classify_unit)
+    usd_indicators = dim_indicators[dim_indicators["unit_type"] == "USD"].copy()
+    usd_codes = set(usd_indicators["indicator_code"])
+
+    fact_usd = fact_debt[fact_debt["indicator_code"].isin(usd_codes)].copy()
+
+    # Export Power BI Star-Schema CSVs
+    dim_countries.to_csv("clean_dim_countries.csv", index=False)
+    usd_indicators.to_csv("clean_dim_indicators.csv", index=False)
+    fact_usd[["country_code", "indicator_code", "year", "debt"]].to_csv("clean_fact_debt_usd.csv", index=False)
+
+    # 4. Build Normalized SQLite Database (PK & FK Relationships)
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA foreign_keys = ON;")
+    cursor.executescript("""
+        DROP VIEW IF EXISTS top_10_debt_countries;
+        DROP TABLE IF EXISTS debt_data;
+        DROP TABLE IF EXISTS indicators;
+        DROP TABLE IF EXISTS countries;
+
+        CREATE TABLE countries (
+            country_code TEXT PRIMARY KEY,
+            country_name TEXT NOT NULL,
+            long_name TEXT,
+            region TEXT,
+            income_group TEXT,
+            lending_category TEXT,
+            currency_unit TEXT
+        );
+
+        CREATE TABLE indicators (
+            indicator_code TEXT PRIMARY KEY,
+            indicator_name TEXT NOT NULL,
+            unit_type TEXT NOT NULL
+        );
+
+        CREATE TABLE debt_data (
+            debt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            country_code TEXT NOT NULL,
+            indicator_code TEXT NOT NULL,
+            year INTEGER NOT NULL,
+            debt REAL NOT NULL,
+            FOREIGN KEY (country_code) REFERENCES countries(country_code),
+            FOREIGN KEY (indicator_code) REFERENCES indicators(indicator_code)
+        );
+    """)
+
+    dim_countries.to_sql("countries", conn, if_exists="append", index=False)
+    usd_indicators.to_sql("indicators", conn, if_exists="append", index=False)
+    fact_usd[["country_code", "indicator_code", "year", "debt"]].to_sql("debt_data", conn, if_exists="append", index=False)
+
+    cursor.executescript("""
+        CREATE INDEX idx_debt_country ON debt_data(country_code);
+        CREATE INDEX idx_debt_indicator ON debt_data(indicator_code);
+        CREATE INDEX idx_debt_year ON debt_data(year);
+
+        CREATE VIEW top_10_debt_countries AS
+        SELECT c.country_name, SUM(d.debt) AS total_debt
+        FROM debt_data d
+        JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name
+        ORDER BY total_debt DESC
+        LIMIT 10;
+    """)
+    conn.commit()
+    conn.close()
+
+    merged_df = fact_usd.merge(dim_countries[["country_code", "region", "income_group"]], on="country_code", how="left")
+    return merged_df, dim_countries, usd_indicators
+
+# ==============================================================================
+# ALL 30 SQL ANALYTICAL QUERIES (Basic, Intermediate, Advanced)
+# ==============================================================================
+SQL_QUERIES = {
+    "Basic 1: Retrieve all distinct country names": "SELECT DISTINCT country_name FROM countries ORDER BY country_name;",
+    "Basic 2: Count total number of countries available": "SELECT COUNT(DISTINCT country_code) AS total_countries FROM countries;",
+    "Basic 3: Find total number of indicators present": "SELECT COUNT(DISTINCT indicator_code) AS total_indicators FROM indicators;",
+    "Basic 4: Display the first 10 records of the dataset": """
+        SELECT d.debt_id, c.country_name, c.country_code, i.indicator_name, d.year, d.debt
+        FROM debt_data d
+        JOIN countries c ON d.country_code = c.country_code
+        JOIN indicators i ON d.indicator_code = i.indicator_code
+        LIMIT 10;
+    """,
+    "Basic 5: Calculate the total global debt": "SELECT ROUND(SUM(debt), 2) AS total_global_debt_usd FROM debt_data;",
+    "Basic 6: List all unique indicator names": "SELECT DISTINCT indicator_code, indicator_name FROM indicators ORDER BY indicator_name;",
+    "Basic 7: Find the number of records for each country": """
+        SELECT c.country_name, COUNT(d.debt_id) AS record_count
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY record_count DESC;
+    """,
+    "Basic 8: Display all records where debt > 1 billion USD": """
+        SELECT c.country_name, i.indicator_name, d.year, d.debt
+        FROM debt_data d
+        JOIN countries c ON d.country_code = c.country_code
+        JOIN indicators i ON d.indicator_code = i.indicator_code
+        WHERE d.debt > 1000000000 ORDER BY d.debt DESC LIMIT 500;
+    """,
+    "Basic 9: Find minimum, maximum, and average debt values": """
+        SELECT ROUND(MIN(debt), 2) AS min_debt, ROUND(MAX(debt), 2) AS max_debt, ROUND(AVG(debt), 2) AS avg_debt FROM debt_data;
+    """,
+    "Basic 10: Count total number of records in the dataset": "SELECT COUNT(*) AS total_records FROM debt_data;",
+
+    "Intermediate 1: Find the total debt for each country": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY total_debt DESC;
+    """,
+    "Intermediate 2: Display top 10 countries with highest total debt": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY total_debt DESC LIMIT 10;
+    """,
+    "Intermediate 3: Find the average debt per country": """
+        SELECT c.country_name, ROUND(AVG(d.debt), 2) AS average_debt
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY average_debt DESC;
+    """,
+    "Intermediate 4: Calculate total debt for each indicator": """
+        SELECT i.indicator_code, i.indicator_name, ROUND(SUM(d.debt), 2) AS total_indicator_debt
+        FROM debt_data d JOIN indicators i ON d.indicator_code = i.indicator_code
+        GROUP BY i.indicator_code, i.indicator_name ORDER BY total_indicator_debt DESC;
+    """,
+    "Intermediate 5: Identify indicator contributing highest total debt": """
+        SELECT i.indicator_code, i.indicator_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN indicators i ON d.indicator_code = i.indicator_code
+        GROUP BY i.indicator_code, i.indicator_name ORDER BY total_debt DESC LIMIT 1;
+    """,
+    "Intermediate 6: Find the country with the lowest total debt": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY total_debt ASC LIMIT 1;
+    """,
+    "Intermediate 7: Total debt for each country and indicator combination": """
+        SELECT c.country_name, i.indicator_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d
+        JOIN countries c ON d.country_code = c.country_code
+        JOIN indicators i ON d.indicator_code = i.indicator_code
+        GROUP BY c.country_name, i.indicator_name ORDER BY c.country_name, total_debt DESC LIMIT 500;
+    """,
+    "Intermediate 8: Count how many indicators each country has": """
+        SELECT c.country_name, COUNT(DISTINCT d.indicator_code) AS indicator_count
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY indicator_count DESC;
+    """,
+    "Intermediate 9: Countries whose total debt is above global average": """
+        WITH country_totals AS (
+            SELECT c.country_name, SUM(d.debt) AS total_debt
+            FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+            GROUP BY c.country_name
+        )
+        SELECT country_name, ROUND(total_debt, 2) AS total_debt
+        FROM country_totals
+        WHERE total_debt > (SELECT AVG(total_debt) FROM country_totals)
+        ORDER BY total_debt DESC;
+    """,
+    "Intermediate 10: Rank countries based on total debt (highest to lowest)": """
+        SELECT RANK() OVER (ORDER BY SUM(d.debt) DESC) AS debt_rank, c.country_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name;
+    """,
+
+    "Advanced 1: Top 5 indicators contributing most to global debt": """
+        SELECT i.indicator_code, i.indicator_name, ROUND(SUM(d.debt), 2) AS total_debt
+        FROM debt_data d JOIN indicators i ON d.indicator_code = i.indicator_code
+        GROUP BY i.indicator_code, i.indicator_name ORDER BY total_debt DESC LIMIT 5;
+    """,
+    "Advanced 2: Percentage contribution of each country to global debt": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt,
+               ROUND((SUM(d.debt) * 100.0) / (SELECT SUM(debt) FROM debt_data), 2) AS global_share_pct
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY global_share_pct DESC;
+    """,
+    "Advanced 3: Top 3 countries for each indicator based on debt": """
+        WITH ind_country AS (
+            SELECT i.indicator_name, c.country_name, SUM(d.debt) AS total_debt
+            FROM debt_data d
+            JOIN countries c ON d.country_code = c.country_code
+            JOIN indicators i ON d.indicator_code = i.indicator_code
+            GROUP BY i.indicator_code, i.indicator_name, c.country_name
+        ),
+        ranked AS (
+            SELECT indicator_name, country_name, total_debt,
+                   DENSE_RANK() OVER (PARTITION BY indicator_name ORDER BY total_debt DESC) AS rnk
+            FROM ind_country
+        )
+        SELECT indicator_name, rnk AS rank_in_indicator, country_name, ROUND(total_debt, 2) AS total_debt
+        FROM ranked WHERE rnk <= 3 ORDER BY indicator_name, rnk LIMIT 500;
+    """,
+    "Advanced 4: Difference between max and min debt for each country": """
+        SELECT c.country_name, ROUND(MAX(d.debt), 2) AS max_debt, ROUND(MIN(d.debt), 2) AS min_debt,
+               ROUND(MAX(d.debt) - MIN(d.debt), 2) AS debt_range_diff
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY debt_range_diff DESC;
+    """,
+    "Advanced 5: Query the SQL View for Top 10 countries with highest debt": """
+        SELECT country_name, ROUND(total_debt, 2) AS total_debt FROM top_10_debt_countries;
+    """,
+    "Advanced 6: Categorize countries into High, Medium, and Low Debt": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt,
+               CASE
+                   WHEN SUM(d.debt) >= 10000000000000 THEN 'High Debt'
+                   WHEN SUM(d.debt) >= 1000000000000 THEN 'Medium Debt'
+                   ELSE 'Low Debt'
+               END AS debt_category
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name ORDER BY total_debt DESC;
+    """,
+    "Advanced 7: Cumulative debt per country using Window Functions": """
+        WITH country_yr AS (
+            SELECT c.country_name, d.year, SUM(d.debt) AS annual_debt
+            FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+            GROUP BY c.country_name, d.year
+        )
+        SELECT country_name, year, ROUND(annual_debt, 2) AS annual_debt,
+               ROUND(SUM(annual_debt) OVER (PARTITION BY country_name ORDER BY year), 2) AS cumulative_country_debt
+        FROM country_yr LIMIT 500;
+    """,
+    "Advanced 8: Indicators where average debt > overall average debt": """
+        SELECT i.indicator_code, i.indicator_name, ROUND(AVG(d.debt), 2) AS indicator_avg_debt
+        FROM debt_data d JOIN indicators i ON d.indicator_code = i.indicator_code
+        GROUP BY i.indicator_code, i.indicator_name
+        HAVING AVG(d.debt) > (SELECT AVG(debt) FROM debt_data)
+        ORDER BY indicator_avg_debt DESC;
+    """,
+    "Advanced 9: Identify countries contributing more than 5% of global debt": """
+        SELECT c.country_name, ROUND(SUM(d.debt), 2) AS total_debt,
+               ROUND((SUM(d.debt) * 100.0) / (SELECT SUM(debt) FROM debt_data), 2) AS global_share_pct
+        FROM debt_data d JOIN countries c ON d.country_code = c.country_code
+        GROUP BY c.country_name
+        HAVING (SUM(d.debt) * 100.0) / (SELECT SUM(debt) FROM debt_data) > 5.0
+        ORDER BY global_share_pct DESC;
+    """,
+    "Advanced 10: Most dominant indicator (highest contribution) per country": """
+        WITH ind_totals AS (
+            SELECT c.country_code, c.country_name, i.indicator_name, SUM(d.debt) AS ind_debt
+            FROM debt_data d
+            JOIN countries c ON d.country_code = c.country_code
+            JOIN indicators i ON d.indicator_code = i.indicator_code
+            GROUP BY c.country_code, c.country_name, i.indicator_name
+        ),
+        dominant_ind AS (
+            SELECT country_name, indicator_name, ind_debt,
+                   ROW_NUMBER() OVER (PARTITION BY country_code ORDER BY ind_debt DESC) AS rn
+            FROM ind_totals
+        )
+        SELECT country_name, indicator_name AS dominant_indicator, ROUND(ind_debt, 2) AS total_debt_amount
+        FROM dominant_ind WHERE rn = 1 ORDER BY total_debt_amount DESC;
+    """
+}
+
+def run_sql(query):
+    conn = sqlite3.connect(DB_NAME)
+    res = pd.read_sql_query(query, conn)
+    conn.close()
+    return res
+
+def build_download_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fn in ["clean_dim_countries.csv", "clean_dim_indicators.csv", "clean_fact_debt_usd.csv", "international_debt_clean.db"]:
+            if os.path.exists(fn):
+                zf.write(fn)
+    return buf.getvalue()
+
+def main():
+    st.set_page_config(page_title="International Debt Analysis System", layout="wide")
+    st.title("International Debt Analysis System (2000 - 2032)")
+    st.caption("World Bank IDS Cleaned Dataset | 120 Sovereign Countries | Normalized SQL & Interactive BI Dashboard")
+
+    if not os.path.exists(DATA_FILE) or not os.path.exists(COUNTRY_META_FILE):
+        st.error("Please upload 'IDS_ALLCountries_Data.csv' and 'IDS_CountryMetaData.csv' to your working directory.")
+        return
+
+    df, dim_countries, dim_indicators = prepare_real_data_and_db()
+
+    # Sidebar Filters
+    st.sidebar.header("Dashboard Filters")
+    years = sorted(df["year"].unique())
+    year_range = st.sidebar.select_slider("Select Year Range", options=years, value=(2010, 2024))
+    regions = sorted(df["region"].dropna().unique())
+    selected_regions = st.sidebar.multiselect("Filter by World Bank Region", regions, default=regions)
+
+    filtered = df[
+        (df["year"] >= year_range[0]) &
+        (df["year"] <= year_range[1]) &
+        (df["region"].isin(selected_regions))
+    ]
+
+    # Top KPI Metrics (Formatted in Trillions/Billions for Full Visibility)
+    total_debt_t = filtered["debt"].sum() / 1e12
+    top_country = filtered.groupby("country_name")["debt"].sum().idxmax() if not filtered.empty else "N/A"
+    
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Cumulative Indicator Volume", f"${total_debt_t:,.2f} T")
+    c2.metric("Sovereign Countries", f"{filtered['country_code'].nunique()}")
+    c3.metric("Monetary Indicators (USD)", f"{filtered['indicator_code'].nunique()}")
+    c4.metric("Top Debt Volume Nation", top_country)
+
+    st.markdown("---")
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "1. Interactive Charts (Plotly)",
+        "2. Statistical Charts (Seaborn & Matplotlib)",
+        "3. All 30 SQL Queries",
+        "4. Cleaned Data & Power BI Pack"
+    ])
+
+    with tab1:
+        col1, col2 = st.columns(2)
+        with col1:
+            top_c = filtered.groupby("country_name", as_index=False)["debt"].sum().sort_values("debt", ascending=False).head(10)
+            fig_bar = px.bar(top_c, x="country_name", y="debt", title="Top 10 Countries by Debt Volume (USD)", color="debt", color_continuous_scale="Blues")
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        with col2:
+            reg_df = filtered.groupby("region", as_index=False)["debt"].sum().sort_values("debt", ascending=False)
+            fig_pie = px.pie(reg_df, names="region", values="debt", title="Debt Distribution by Global Region", hole=0.4)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        trend_df = filtered.groupby(["year", "income_group"], as_index=False)["debt"].sum()
+        fig_line = px.line(trend_df, x="year", y="debt", color="income_group", markers=True, title="Debt Trajectory by Income Group (Historical & Projected)")
+        st.plotly_chart(fig_line, use_container_width=True)
+
+    with tab2:
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            fig1, ax1 = plt.subplots(figsize=(8, 5))
+            top10_s = filtered.groupby("country_name")["debt"].sum().sort_values(ascending=False).head(10) / 1e12
+            sns.barplot(x=top10_s.values, y=top10_s.index, palette="viridis", ax=ax1)
+            ax1.set_title("Top 10 Indebted Countries (Trillion USD) - Seaborn")
+            ax1.set_xlabel("Total Volume (Trillion USD)")
+            ax1.set_ylabel("Country")
+            plt.tight_layout()
+            st.pyplot(fig1)
+
+        with sc2:
+            fig2, ax2 = plt.subplots(figsize=(8, 5))
+            inc_s = filtered.groupby("income_group")["debt"].sum().sort_values(ascending=False) / 1e12
+            sns.barplot(x=inc_s.index, y=inc_s.values, palette="magma", ax=ax2)
+            ax2.set_title("Debt Volume by Income Classification (Trillion USD)")
+            ax2.set_ylabel("Total Volume (Trillion USD)")
+            plt.xticks(rotation=20)
+            plt.tight_layout()
+            st.pyplot(fig2)
+
+    with tab3:
+        st.subheader("Execute All 30 Required SQL Queries on Your Cleaned Database")
+        q_choice = st.selectbox("Select SQL Analytical Question:", list(SQL_QUERIES.keys()))
+        sql_text = SQL_QUERIES[q_choice]
+        st.code(sql_text.strip(), language="sql")
+        st.dataframe(run_sql(sql_text), use_container_width=True)
+
+    with tab4:
+        st.subheader("Download Cleaned CSVs for Power BI & GitHub")
+        st.write(f"Cleaned database contains **{len(dim_countries)} sovereign countries**, **{len(dim_indicators)} monetary indicators**, and **{len(df):,} verified records**.")
+        st.download_button(
+            label="Download Power BI Star-Schema CSVs & SQLite DB (.zip)",
+            data=build_download_zip(),
+            file_name="Cleaned_International_Debt_Deliverables.zip",
+            mime="application/zip"
+        )
+        st.dataframe(filtered.head(100), use_container_width=True)
+
+if __name__ == "__main__":
+    main()
+'''
+
+with open("app.py", "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+print("Generated 'app.py' connected to your real World Bank IDS files!")
+
+# ==============================================================================
+# 3. LAUNCH STREAMLIT IN GOOGLE COLAB
+# ==============================================================================
+if "google.colab" in sys.modules:
+    print("Launching Streamlit Dashboard...")
+    subprocess.Popen(["streamlit", "run", "app.py", "--server.port", "8501", "--server.headless", "true"])
+    
+    if not os.path.exists("cloudflared-linux-amd64"):
+        subprocess.run(["wget", "-q", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"])
+        subprocess.run(["chmod", "+x", "cloudflared-linux-amd64"])
+    
+    import time, re
+    tunnel = subprocess.Popen(["./cloudflared-linux-amd64", "tunnel", "--url", "http://localhost:8501"], stderr=subprocess.PIPE, text=True)
+    for _ in range(30):
+        line = tunnel.stderr.readline()
+        match = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+        if match:
+            print(f"\nOPEN YOUR LIVE DASHBOARD HERE: {match.group(0)}\n")
+            break
+        time.sleep(0.5)
